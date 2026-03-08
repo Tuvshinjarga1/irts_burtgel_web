@@ -1,0 +1,11 @@
+opencv-python
+retina-face
+keras-facenet
+tensorflow
+scikit-learn
+numpy
+scikit-image
+fastapi
+uvicorn
+python-multipart
+pydantic
