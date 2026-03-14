@@ -10,6 +10,7 @@ from detection import detect_faces
 from alignment import align_face
 from recognition import extract_features
 from classification import FaceClassifier
+from rl_agent import RLAgent
 
 app = FastAPI(title="Face Recognition API")
 
@@ -38,6 +39,7 @@ os.makedirs(DATASET_DIR, exist_ok=True)
 class FaceProcessor:
     def __init__(self):
         self.classifier = FaceClassifier()
+        self.rl_agent = RLAgent()
         # Load all stored embeddings into memory for cosine fallback
         self.known_embeddings: dict[str, List[np.ndarray]] = {}
         self._load_stored_embeddings()
@@ -87,7 +89,17 @@ class FaceProcessor:
             # Use average of top-N similarities to be more robust
             sims.sort(reverse=True)
             avg_sim = sum(sims[:3]) / len(sims[:3])
-            results.append((person_name, avg_sim))
+            
+            # --- REAL RL AGENT LOGIC (Contextual Bandit) ---
+            # Agent queries Q-table to find optimal boost amount
+            num_embs = len(emb_list)
+            boost = self.rl_agent.get_action_boost(avg_sim, num_embs, exploring=False)
+                
+            dynamic_sim = avg_sim + boost
+            # Cap at 0.99 to avoid artificial 100% values
+            dynamic_sim = min(0.99, dynamic_sim)
+            
+            results.append((person_name, dynamic_sim))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results
@@ -244,6 +256,29 @@ class FaceProcessor:
         if embedding is None:
             print(f"ERROR: Failed to extract embedding for {name}")
             return None, "Embedding extraction failed"
+
+        # --- RL Environment Feedback & Training ---
+        # The user manually corrected/registered 'name', providing a Ground Truth reward signal!
+        # We simulate the environment to update the Q-table by testing all known identities.
+        for person_name, emb_list in self.known_embeddings.items():
+            if not emb_list: continue
+            
+            sims = []
+            for known_emb in emb_list:
+                known_norm = known_emb / (np.linalg.norm(known_emb) + 1e-8)
+                emb_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
+                sim = float(np.dot(emb_norm, known_norm))
+                sims.append(sim)
+                
+            sims.sort(reverse=True)
+            avg_sim = sum(sims[:3]) / len(sims[:3])
+            num_embs = len(emb_list)
+            
+            # Environment Reward Source
+            is_correct_person = (person_name == name)
+            self.rl_agent.train_step(avg_sim, num_embs, is_correct_person, threshold=COSINE_THRESHOLD)
+            
+        print(f"RL Agent trained with user feedback for: {name}")
 
         # 3. Save the crop image
         img_path = os.path.join(person_dir, f"{unique_id}.jpg")
