@@ -4,12 +4,21 @@ import React, { useState, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Loader2, Camera, Upload } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Loader2, Upload, ThumbsUp, ThumbsDown, ChevronDown, ChevronUp, Brain, Gauge } from "lucide-react";
+
+interface TopKCandidate {
+  name: string;
+  score: number;
+  above_threshold: boolean;
+}
 
 interface FaceResult {
   bbox: [number, number, number, number];
   identity: string;
   confidence: number;
+  det_score?: number;
+  top_k?: TopKCandidate[];
 }
 
 export function FaceRecognizer() {
@@ -18,11 +27,18 @@ export function FaceRecognizer() {
   const [faces, setFaces] = useState<FaceResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+  const [threshold, setThreshold] = useState<number | null>(null);
+
   // For registering unknown names
   const [faceNames, setFaceNames] = useState<Record<number, string>>({});
   const [activeFaceIndex, setActiveFaceIndex] = useState<number | null>(null);
   const [registering, setRegistering] = useState(false);
+
+  // RL feedback state
+  const [feedbackSent, setFeedbackSent] = useState<Record<number, "correct" | "wrong">>({});
+  const [feedbackLoading, setFeedbackLoading] = useState<Record<number, boolean>>({});
+  const [expandedTopK, setExpandedTopK] = useState<Record<number, boolean>>({});
+  const [rlInfo, setRlInfo] = useState<{ threshold: number } | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -117,6 +133,9 @@ export function FaceRecognizer() {
       const data = await res.json();
       if (data.results) {
         setFaces(data.results);
+        setFeedbackSent({});
+        setExpandedTopK({});
+        if (data.threshold !== undefined) setThreshold(data.threshold);
       } else if (data.error) {
         setError(data.error);
       }
@@ -127,19 +146,47 @@ export function FaceRecognizer() {
     }
   };
 
+  // ── RL Feedback ──────────────────────────────────────────────────────────
+  const handleFeedback = async (index: number, correct: boolean) => {
+    const face = faces[index];
+    setFeedbackLoading(prev => ({ ...prev, [index]: true }));
+    try {
+      const res = await fetch("http://localhost:8000/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ correct, confidence: face.confidence }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFeedbackSent(prev => ({ ...prev, [index]: correct ? "correct" : "wrong" }));
+        if (data.threshold !== undefined) {
+          setThreshold(data.threshold);
+          setRlInfo({ threshold: data.threshold });
+        }
+      }
+    } catch (e) {
+      // feedback is best-effort
+    } finally {
+      setFeedbackLoading(prev => ({ ...prev, [index]: false }));
+    }
+  };
+
   const handleRegister = async (index: number) => {
     const name = faceNames[index];
     if (!selectedFile || !name?.trim()) return;
     
     const face = faces[index];
-    const bboxStr = face.bbox.join(",");
+    const [x1, y1, x2, y2] = face.bbox;
 
     setRegistering(true);
     try {
       const formData = new FormData();
       formData.append("file", selectedFile);
       formData.append("name", name.trim());
-      formData.append("bbox", bboxStr);
+      formData.append("x1", String(x1));
+      formData.append("y1", String(y1));
+      formData.append("x2", String(x2));
+      formData.append("y2", String(y2));
 
       const res = await fetch("http://localhost:8000/register", {
         method: "POST",
@@ -222,10 +269,23 @@ export function FaceRecognizer() {
   return (
     <Card className="w-full max-w-4xl mx-auto shadow-lg">
       <CardHeader>
-        <CardTitle>AI Царай Таних Систем</CardTitle>
-        <CardDescription>
-          Зураг оруулж царайгаа таниулах болон танигдаагүй царайг системд шинээр бүртгэх
-        </CardDescription>
+        <div className="flex items-start justify-between">
+          <div>
+            <CardTitle>AI Царай Таних Систем</CardTitle>
+            <CardDescription>
+              Зураг оруулж царайгаа таниулах болон танигдаагүй царайг системд шинээр бүртгэх
+            </CardDescription>
+          </div>
+          {threshold !== null && (
+            <div className="flex items-center gap-2 shrink-0 ml-4">
+              <div className="flex items-center gap-1.5 bg-violet-50 border border-violet-200 rounded-lg px-3 py-1.5">
+                <Brain className="w-4 h-4 text-violet-600" />
+                <span className="text-xs font-medium text-violet-700">RL Threshold</span>
+                <span className="text-sm font-bold text-violet-900">{(threshold * 100).toFixed(1)}%</span>
+              </div>
+            </div>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="flex gap-4">
@@ -356,51 +416,177 @@ export function FaceRecognizer() {
 
         {faces.length > 0 && (
           <div className="space-y-4">
-            <h3 className="text-lg font-medium border-b pb-2">Илэрсэн царайнууд:</h3>
+            <div className="flex items-center justify-between border-b pb-2">
+              <h3 className="text-lg font-medium">Илэрсэн царайнууд:</h3>
+              <Badge variant="outline" className="text-xs">{faces.length} царай</Badge>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {faces.map((face, index) => (
-                <div 
-                  key={index} 
-                  className={`p-4 border rounded-lg ${
-                    face.identity === "Unknown" ? "border-red-300 bg-red-50" : "border-green-300 bg-green-50"
-                  }`}
-                >
-                  <div className="mb-2">
-                    <span className="font-semibold">{face.identity === "Unknown" ? "Танихгүй хүн" : face.identity}</span>
-                    <span className="text-sm text-gray-500 ml-2">
-                      ({(face.confidence * 100).toFixed(1)}%)
-                    </span>
-                  </div>
-                  
-                  {face.identity === "Unknown" && (
-                    <div className="mt-4 space-y-2">
-                      <div className="space-y-2">
-                        <Input 
-                          placeholder="Нэрийг оруулна уу" 
-                          value={faceNames[index] || ""}
-                          onChange={(e) => {
-                            setFaceNames(prev => ({
-                              ...prev,
-                              [index]: e.target.value
-                            }));
-                          }}
-                        />
-                        <div className="flex gap-2">
-                          <Button 
-                            size="sm" 
-                            onClick={() => handleRegister(index)} 
+              {faces.map((face, index) => {
+                const isUnknown = face.identity === "Unknown";
+                const feedback = feedbackSent[index];
+                const isLoadingFb = feedbackLoading[index];
+                const showTopK = expandedTopK[index];
+
+                return (
+                  <div
+                    key={index}
+                    className={`rounded-xl border-2 overflow-hidden transition-all ${
+                      isUnknown
+                        ? "border-red-200 bg-gradient-to-br from-red-50 to-orange-50"
+                        : "border-green-200 bg-gradient-to-br from-green-50 to-emerald-50"
+                    }`}
+                  >
+                    {/* Header */}
+                    <div className={`px-4 py-2 flex items-center justify-between ${
+                      isUnknown ? "bg-red-100/60" : "bg-green-100/60"
+                    }`}>
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2.5 h-2.5 rounded-full ${
+                          isUnknown ? "bg-red-500" : "bg-green-500"
+                        }`} />
+                        <span className="font-semibold text-sm">
+                          {isUnknown ? "Танихгүй хүн" : face.identity}
+                        </span>
+                      </div>
+                      <Badge
+                        variant="secondary"
+                        className={`text-xs font-bold ${
+                          isUnknown ? "bg-red-200 text-red-800" : "bg-green-200 text-green-800"
+                        }`}
+                      >
+                        {(face.confidence * 100).toFixed(1)}%
+                      </Badge>
+                    </div>
+
+                    <div className="px-4 py-3 space-y-3">
+                      {/* Detection confidence bar */}
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px] text-gray-500 font-medium uppercase">
+                          <span>Таних нарийвчлал</span>
+                          <span>{(face.confidence * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-700 ${
+                              isUnknown ? "bg-red-400" : "bg-green-500"
+                            }`}
+                            style={{ width: `${Math.min(face.confidence * 100, 100)}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* RL Reward Feedback — only for known faces */}
+                      {!isUnknown && (
+                        <div className="space-y-1.5">
+                          <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wide flex items-center gap-1">
+                            <Brain className="w-3 h-3" /> RL Feedback
+                          </p>
+                          {feedback ? (
+                            <div className={`flex items-center gap-2 text-xs font-medium rounded-lg px-3 py-1.5 ${
+                              feedback === "correct"
+                                ? "bg-emerald-100 text-emerald-700"
+                                : "bg-rose-100 text-rose-700"
+                            }`}>
+                              {feedback === "correct" ? (
+                                <><ThumbsUp className="w-3.5 h-3.5" /> Зөв гэж тэмдэглэгдлээ</>  
+                              ) : (
+                                <><ThumbsDown className="w-3.5 h-3.5" /> Буруу гэж тэмдэглэгдлээ</>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="flex gap-2">
+                              <Button
+                                id={`feedback-correct-${index}`}
+                                size="sm"
+                                variant="outline"
+                                className="flex-1 h-8 text-xs border-green-300 text-green-700 hover:bg-green-100 hover:border-green-400 gap-1"
+                                disabled={isLoadingFb}
+                                onClick={() => handleFeedback(index, true)}
+                              >
+                                {isLoadingFb ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <ThumbsUp className="w-3 h-3" />
+                                )}
+                                Зөв
+                              </Button>
+                              <Button
+                                id={`feedback-wrong-${index}`}
+                                size="sm"
+                                variant="outline"
+                                className="flex-1 h-8 text-xs border-red-300 text-red-700 hover:bg-red-100 hover:border-red-400 gap-1"
+                                disabled={isLoadingFb}
+                                onClick={() => handleFeedback(index, false)}
+                              >
+                                {isLoadingFb ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <ThumbsDown className="w-3 h-3" />
+                                )}
+                                Буруу
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Top-K candidates */}
+                      {face.top_k && face.top_k.length > 0 && (
+                        <div className="space-y-1.5">
+                          <button
+                            className="flex items-center gap-1 text-[10px] font-bold text-gray-400 uppercase tracking-wide w-full hover:text-gray-600 transition-colors"
+                            onClick={() => setExpandedTopK(prev => ({ ...prev, [index]: !prev[index] }))}
+                          >
+                            <Gauge className="w-3 h-3" />
+                            Top топ дүнгүүд
+                            {showTopK ? <ChevronUp className="w-3 h-3 ml-auto" /> : <ChevronDown className="w-3 h-3 ml-auto" />}
+                          </button>
+                          {showTopK && (
+                            <div className="space-y-1">
+                              {face.top_k.map((cand, ci) => (
+                                <div key={ci} className="flex items-center justify-between text-xs rounded px-2 py-1 bg-white/70">
+                                  <span className={`font-medium ${
+                                    cand.above_threshold ? "text-green-700" : "text-gray-500"
+                                  }`}>{cand.name}</span>
+                                  <span className={`font-mono text-[11px] ${
+                                    cand.above_threshold ? "text-green-600" : "text-gray-400"
+                                  }`}>{(cand.score * 100).toFixed(1)}%</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Register form for unknown faces */}
+                      {isUnknown && (
+                        <div className="space-y-2 pt-1">
+                          <Input
+                            placeholder="Нэрийг оруулна уу"
+                            value={faceNames[index] || ""}
+                            onChange={(e) => {
+                              setFaceNames(prev => ({ ...prev, [index]: e.target.value }));
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") handleRegister(index);
+                            }}
+                            className="h-9 text-sm"
+                          />
+                          <Button
+                            size="sm"
+                            onClick={() => handleRegister(index)}
                             disabled={registering || !(faceNames[index]?.trim())}
-                            className="w-full"
+                            className="w-full h-9"
                           >
                             {registering && <Loader2 className="w-4 h-4 animate-spin mr-2" />}
                             Хадгалах
                           </Button>
                         </div>
-                      </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              ))}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
