@@ -1,11 +1,29 @@
-opencv-python
-retina-face
-keras-facenet
-tensorflow
-scikit-learn
-numpy
-scikit-image
-fastapi
-uvicorn
-python-multipart
-pydantic
+# ─────────────────────────────────────────────────────────────────────────────
+# Face Recognition Core – Python dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Web API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+pydantic>=2.0.0
+
+# Deep-learning backbone
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Face detection
+retina-face>=0.0.13          # pip install retina-face
+# Alternative: pip install retinaface-pytorch
+
+# Face alignment (norm_crop)
+insightface>=0.7.3
+onnxruntime>=1.17.0          # CPU ONNX runtime (GPU: onnxruntime-gpu)
+
+# Feature extraction / embedding
+facenet-pytorch>=2.5.3
+
+# Image processing
+opencv-python>=4.9.0
+numpy>=1.24.0
+Pillow>=10.0.0
