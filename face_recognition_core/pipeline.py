@@ -1,8 +1,8 @@
 """
 pipeline.py
 -----------
-Orchestrates the complete face recognition pipeline:
-    Detect -> Align -> Embed -> Classify/Verify + RL Threshold
+Orchestrates the complete face recognition pipeline using InsightFace ArcFace.
+The FaceAnalysis class handles Detection, Alignment, and Embedding natively.
 """
 from __future__ import annotations
 
@@ -12,14 +12,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from database  import FaceDatabase
-from detection import detect, _synthetic_landmarks
-from alignment import align_faces
-from embedding import embed_batch
 from rl_agent  import RLThresholdAgent
 from similarity import find_best_match, find_top_k_matches
 
 logger = logging.getLogger(__name__)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Result dataclass
@@ -48,13 +44,30 @@ class FaceResult:
 _db    = FaceDatabase()
 _agent = RLThresholdAgent()
 
-
 def get_database() -> FaceDatabase:
     return _db
 
-
 def get_agent() -> RLThresholdAgent:
     return _agent
+
+# ──────────────────────────────────────────────────────────────────────────────
+# InsightFace Singleton
+# ──────────────────────────────────────────────────────────────────────────────
+_analyzer = None
+
+def _get_analyzer():
+    global _analyzer
+    if _analyzer is None:
+        try:
+            import insightface
+            from insightface.app import FaceAnalysis
+            logger.info("Initializing InsightFace (buffalo_l)...")
+            _analyzer = FaceAnalysis(name="buffalo_l", allowed_modules=['detection', 'recognition'])
+            _analyzer.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info("InsightFace loaded.")
+        except ImportError as exc:
+            raise RuntimeError("insightface not installed. Please install it.") from exc
+    return _analyzer
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -73,20 +86,16 @@ def _iou(a: list[int], b: list[int]) -> float:
     return inter / float(area_a + area_b - inter)
 
 
-def _pick_closest_detection(
-    detections: list[dict],
-    x1: int, y1: int, x2: int, y2: int,
-    min_iou: float = 0.10,
-) -> dict | None:
-    best_det   = None
+def _pick_closest_face(faces: list, x1: int, y1: int, x2: int, y2: int, min_iou: float = 0.10):
+    best_face  = None
     best_score = min_iou
     target = [x1, y1, x2, y2]
-    for det in detections:
-        s = _iou(det["bbox"], target)
+    for f in faces:
+        s = _iou(list(f.bbox), target)
         if s > best_score:
             best_score = s
-            best_det   = det
-    return best_det
+            best_face = f
+    return best_face
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,60 +103,30 @@ def _pick_closest_detection(
 # ──────────────────────────────────────────────────────────────────────────────
 
 # How much the top score must exceed the 2nd-best candidate to accept a match.
-# Prevents accidental matches when multiple people score similarly.
-_MARGIN = 0.05
+# ArcFace discriminates well, so margin can be slightly larger if needed, but 0.01 is completely fine.
+_MARGIN = 0.01
 
 
 def recognize(image_bgr: np.ndarray) -> list[FaceResult]:
-    """Detect → Align → Embed → Classify with uniqueness constraint."""
-
-    # Stage 1: Detection
-    detections = detect(image_bgr)
-    if not detections:
+    """Detect → Embed → Classify with uniqueness constraint using ArcFace."""
+    app = _get_analyzer()
+    faces = app.get(image_bgr)
+    
+    if not faces:
         return []
 
-    # Stage 2: Alignment
-    chips = align_faces(image_bgr, detections)
-    if not chips:
-        return []
-
-    det_chip_pairs = [
-        (det, chip)
-        for det, chip in zip(detections, chips)
-        if chip is not None and chip.size > 0
-    ]
-    if not det_chip_pairs:
-        return []
-
-    aligned_dets  = [p[0] for p in det_chip_pairs]
-    aligned_chips = [p[1] for p in det_chip_pairs]
-
-    # Stage 3: Feature extraction
-    embeddings = embed_batch(aligned_chips)
-
-    # Stage 4: Classification — compute raw scores for every face
     db_store  = _db.items()
     threshold = _agent.threshold   # read-only here; changed only via /feedback
 
     raw: list[tuple[str, float, list[dict]]] = []
-    for emb in embeddings:
+    
+    for f in faces:
+        emb = f.normed_embedding
         identity, score = find_best_match(emb, db_store, threshold)
         top_k = find_top_k_matches(emb, db_store, k=3, threshold=threshold)
         raw.append((identity, score, top_k))
 
     # ── Uniqueness constraint ─────────────────────────────────────────────────
-    # Problem: FaceNet cosine similarity between similar-looking people of the
-    # same demographic can reach 80–95 %.  Without this block every face in a
-    # group photo would be labelled with the ONE registered person's name.
-    #
-    # Fix: each registered identity is assigned to AT MOST ONE face per image —
-    #      the face with the HIGHEST similarity score for that identity.
-    #      Every other face that would also match → "Unknown".
-    #
-    # Margin check: even the best-matching face must outscore its 2nd candidate
-    #      by at least _MARGIN (5 pp) — filters ambiguous near-tie situations.
-
-    # Pass A: find the winner index for each identity
     best_idx_for: dict[str, tuple[int, float]] = {}
     for i, (identity, score, _) in enumerate(raw):
         if identity != "Unknown":
@@ -157,27 +136,26 @@ def recognize(image_bgr: np.ndarray) -> list[FaceResult]:
 
     # Pass B: apply uniqueness + margin; build final results
     results: list[FaceResult] = []
-    for i, (det, (identity, score, top_k)) in enumerate(zip(aligned_dets, raw)):
+    for i, (f, (identity, score, top_k)) in enumerate(zip(faces, raw)):
         final_identity = identity
 
         if identity != "Unknown":
             winner_idx, _ = best_idx_for.get(identity, (-1, 0.0))
 
             if winner_idx != i:
-                # Another face scored higher for this identity → this one loses
                 final_identity = "Unknown"
             else:
-                # Margin check: top score vs second candidate
                 if len(top_k) >= 2:
                     if score - top_k[1]["score"] < _MARGIN:
                         final_identity = "Unknown"
 
+        bbox = [int(v) for v in f.bbox]
         results.append(
             FaceResult(
-                bbox=det["bbox"],
+                bbox=bbox,
                 identity=final_identity,
                 confidence=score,
-                det_score=det["score"],
+                det_score=float(f.det_score),
                 top_k=top_k,
             )
         )
@@ -195,41 +173,30 @@ def register(
 ) -> bool:
     """Add a face embedding for *name* to the database."""
     try:
-        if bbox:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-
-            # Strategy 1: detect on FULL image, find the face closest to bbox
-            detections = detect(image_bgr)
-            det = _pick_closest_detection(detections, x1, y1, x2, y2)
-
-            if det is not None:
-                logger.info("register: matched detection (IoU>0.10).")
-                chips = align_faces(image_bgr, [det])
-            else:
-                # Strategy 2: bbox is known but detector missed it — use
-                # synthetic landmarks built from the bbox coordinates directly.
-                logger.info("register: using synthetic landmarks from bbox %s.", bbox)
-                lm = _synthetic_landmarks(x1, y1, x2, y2)
-                synthetic_det = {"bbox": [x1, y1, x2, y2], "landmarks": lm, "score": 1.0}
-                chips = align_faces(image_bgr, [synthetic_det])
-        else:
-            detections = detect(image_bgr)
-            if not detections:
-                logger.warning("register: no face detected.")
-                return False
-            det = sorted(detections, key=lambda d: d["score"], reverse=True)[0]
-            chips = align_faces(image_bgr, [det])
-
-        if not chips:
-            logger.warning("register: alignment produced no chip.")
+        app = _get_analyzer()
+        faces = app.get(image_bgr)
+        
+        if not faces:
+            logger.warning("register: no face detected.")
             return False
 
-        embs = embed_batch(chips)
-        if not embs:
+        if bbox:
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            best_face = _pick_closest_face(faces, x1, y1, x2, y2)
+            if best_face is None:
+                logger.warning("register: could not match face to provided bbox.")
+                return False
+            target_face = best_face
+        else:
+            # pick highest detection score face
+            target_face = sorted(faces, key=lambda f: f.det_score, reverse=True)[0]
+            
+        emb = target_face.normed_embedding
+        if emb is None or emb.size == 0:
             logger.warning("register: embedding failed.")
             return False
 
-        _db.add(name, embs[0])
+        _db.add(name, emb)
         _agent.reward_register(len(_db))
         logger.info("register: '%s' stored (db_size=%d).", name, len(_db))
         return True

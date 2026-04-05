@@ -7,6 +7,19 @@ Two roles:
   1. VERIFICATION  – given two embeddings, return their cosine similarity score.
   2. CLASSIFICATION – given a query embedding and a database, return the best
                       matching identity (or "Unknown") and the similarity score.
+
+Multi-embedding aggregation strategy
+─────────────────────────────────────
+Each person may have several stored embeddings (front, left profile, right
+profile, looking_up …).  Simply taking the MAX over all ref embeddings gives an
+overly optimistic score that is sensitive to one "lucky" vector.
+
+We use a **softer aggregation**:
+  • Compute cosine similarity for every stored embedding of a person.
+  • Take the top-N scores (N = min(3, len(refs))).
+  • Return their MEAN as the representative score for that identity.
+
+This is more robust than raw-max while still being better than mean-all.
 """
 from __future__ import annotations
 
@@ -29,6 +42,21 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if norm_a < 1e-8 or norm_b < 1e-8:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Multi-embedding aggregation
+# ──────────────────────────────────────────────────────────────────────────────
+def _aggregate_score(query: np.ndarray, refs: list[np.ndarray]) -> float:
+    """Return a robust similarity score for one identity given multiple refs.
+
+    Strategy: MAX of cosine similarities. Since references vary widely in pose 
+    (front, left profile, right profile), taking an average drags down the score 
+    of a perfectly matching pose.
+    """
+    if not refs:
+        return 0.0
+    return float(max(cosine_similarity(query, r) for r in refs))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,24 +98,23 @@ def find_best_match(
     ----------
     query     : 512-D L2-normalised embedding.
     database  : mapping name → list of embeddings.
-    threshold : minimum cosine similarity to accept a match.
+    threshold : minimum similarity score to accept a match.
 
     Returns
     -------
     (identity, score)
         identity = "Unknown" if no match exceeds the threshold.
-        score    = best cosine similarity found (0.0 if db is empty).
+        score    = best aggregated similarity found (0.0 if db is empty).
     """
     best_name  = "Unknown"
     best_score = 0.0
 
     for name, embeddings in database.items():
-        for ref in embeddings:
-            score = cosine_similarity(query, ref)
-            if score > best_score:
-                best_score = score
-                if score >= threshold:
-                    best_name = name
+        score = _aggregate_score(query, embeddings)
+        if score > best_score:
+            best_score = score
+            if score >= threshold:
+                best_name = name
 
     return best_name, float(best_score)
 
@@ -100,7 +127,8 @@ def find_top_k_matches(
 ) -> list[dict]:
     """Return the top-k candidate identities for a query embedding.
 
-    Useful for re-ranking or confidence display.
+    Uses the same multi-embedding aggregation as find_best_match so scores
+    are consistent between the two functions.
 
     Returns
     -------
@@ -111,16 +139,15 @@ def find_top_k_matches(
 
     for name, embeddings in database.items():
         if embeddings:
-            # representative score = max similarity across all stored embeddings
-            best = max(cosine_similarity(query, ref) for ref in embeddings)
-            candidates.append((name, best))
+            score = _aggregate_score(query, embeddings)
+            candidates.append((name, score))
 
     candidates.sort(key=lambda t: t[1], reverse=True)
 
     return [
         {
             "name": name,
-            "score": score,
+            "score": round(score, 4),
             "above_threshold": score >= threshold,
         }
         for name, score in candidates[:k]

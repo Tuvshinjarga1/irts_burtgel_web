@@ -14,12 +14,16 @@ Endpoints:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import threading
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import requests as _requests
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -162,6 +166,99 @@ async def health():
         "embeddings": db.count_embeddings(),
         "rl_info":    agent.info(),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# POST /enroll-dataset  — bulk enroll from JSON dataset
+# ──────────────────────────────────────────────────────────────────────────────
+_enroll_status: dict = {"running": False, "done": 0, "failed": 0, "total": 0, "log": []}
+
+
+def _run_enroll(dataset_path: str) -> None:
+    """Background task: download images from dataset JSON and register faces."""
+    global _enroll_status
+    _enroll_status["running"] = True
+    _enroll_status["done"]    = 0
+    _enroll_status["failed"]  = 0
+    _enroll_status["log"]     = []
+
+    try:
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as exc:
+        _enroll_status["running"] = False
+        _enroll_status["log"].append(f"ERROR reading dataset: {exc}")
+        return
+
+    _enroll_status["total"] = len(records)
+    db = get_database()
+
+    for rec in records:
+        name      = rec.get("userName", "").strip()
+        image_url = rec.get("imageUrl", "").strip()
+        angle     = rec.get("angleLabel", "")
+
+        if not name or not image_url:
+            _enroll_status["failed"] += 1
+            continue
+
+        try:
+            resp = _requests.get(image_url, timeout=15)
+            resp.raise_for_status()
+            arr   = np.frombuffer(resp.content, dtype=np.uint8)
+            image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("cv2.imdecode returned None")
+
+            ok = register(image, name)
+            if ok:
+                _enroll_status["done"] += 1
+                _enroll_status["log"].append(f"OK  [{angle}] {name}")
+            else:
+                _enroll_status["failed"] += 1
+                _enroll_status["log"].append(f"SKIP (no face) [{angle}] {name}")
+        except Exception as exc:
+            _enroll_status["failed"] += 1
+            _enroll_status["log"].append(f"ERR [{angle}] {name}: {exc}")
+
+    _enroll_status["running"] = False
+    logger.info(
+        "Enroll done: %d enrolled, %d failed out of %d records.",
+        _enroll_status["done"],
+        _enroll_status["failed"],
+        _enroll_status["total"],
+    )
+
+
+@app.post("/enroll-dataset")
+async def enroll_dataset(
+    background_tasks: BackgroundTasks,
+    dataset_path: str = Form(
+        default=r"C:\Users\hp\Desktop\KH DIPLOM HUN AIMR\DS\face_datasets_2026-04-05.json"
+    ),
+):
+    """Bulk-enroll all faces from a local dataset JSON file.
+
+    The JSON must be a list of objects with fields:
+        userName  : str   — identity name
+        imageUrl  : str   — public image URL
+        angleLabel: str   — optional, for logging only
+
+    Processing runs in the background; poll /enroll-status for progress.
+    """
+    if _enroll_status["running"]:
+        raise HTTPException(status_code=409, detail="Enroll already running.")
+    if not Path(dataset_path).exists():
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
+
+    background_tasks.add_task(_run_enroll, dataset_path)
+    return {"message": "Bulk enroll started in background.", "poll": "/enroll-status"}
+
+
+@app.get("/enroll-status")
+async def enroll_status():
+    """Return current bulk-enroll progress."""
+    return _enroll_status
 
 
 # ──────────────────────────────────────────────────────────────────────────────

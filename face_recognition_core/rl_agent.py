@@ -37,13 +37,13 @@ ALPHA     = 0.1         # learning rate
 GAMMA     = 0.9         # discount factor
 EPSILON   = 0.1         # ε-greedy exploration
 
-THRESHOLD_MIN  = 0.72    # FaceNet: different people in same demographic often score 0.65-0.85
-THRESHOLD_MAX  = 0.92
-THRESHOLD_INIT = 0.78    # conservative start; only lower via confirmed correct feedback
+THRESHOLD_MIN  = 0.25    # ArcFace: threshold can safely go lower
+THRESHOLD_MAX  = 0.60
+THRESHOLD_INIT = 0.35    # ArcFace standard cosine threshold is ~0.35-0.45
 THRESHOLD_STEP = 0.01    # gradual steps only
 
 # Bucket boundaries
-_CONF_EDGES   = [0.0, 0.45, 0.55, 0.65, 0.75, 1.01]   # 5 buckets
+_CONF_EDGES   = [0.0, 0.20, 0.30, 0.45, 0.60, 1.01]   # 5 buckets
 _DBSZ_EDGES   = [0, 2, 5, 10, 20, int(1e9)]            # 5 buckets
 
 
